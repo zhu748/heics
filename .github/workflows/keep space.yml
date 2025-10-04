@@ -38,6 +38,7 @@ jobs:
         id: set-matrix
         run: |
           set +e
+          echo "📋 准备监控列表..."
           if [ -z "$SPACES_TO_MONITOR" ]; then
             echo "::error::SPACES_TO_MONITOR is empty"
             echo "status=failed" >> $GITHUB_OUTPUT
@@ -62,6 +63,7 @@ jobs:
               if [ -n "$name" ] && [ -n "$url" ]; then
                 if [[ ! "$url" =~ ^https?:// ]]; then
                   errors=$((errors + 1))
+                  echo "::warning::无效URL: $url"
                   continue
                 fi
                 name_escaped=$(json_escape "$name")
@@ -75,6 +77,7 @@ jobs:
                 matrix_json+="{\"name\":\"$name_escaped\",\"url\":\"$url_escaped\"}"
                 spaces_list+="- **${name}**: ${url}"
                 count=$((count + 1))
+                echo "✅ 添加监控: $name - $url"
               fi
             fi
           done <<< "$SPACES_TO_MONITOR"
@@ -97,12 +100,17 @@ jobs:
             echo "count=0" >> $GITHUB_OUTPUT
             exit 1
           fi
+          echo "📊 总共准备监控 $count 个空间"
           echo "matrix=$matrix_json" >> $GITHUB_OUTPUT
           echo "spaces_list<<EOF" >> $GITHUB_OUTPUT
           echo -e "$spaces_list" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
           echo "count=$count" >> $GITHUB_OUTPUT
           echo "status=success" >> $GITHUB_OUTPUT
+          if [ "${{ inputs.debug_mode }}" = "true" ]; then
+            echo "🔍 调试模式已启用"
+            echo "生成的矩阵: $matrix_json"
+          fi
 
       - name: 验证准备结果
         if: always()
@@ -125,6 +133,12 @@ jobs:
       matrix: ${{fromJson(needs.prepare.outputs.matrix)}}
     continue-on-error: true
     steps:
+      - name: 准备监控环境
+        run: |
+          echo "📊 监控开始于 $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S CST')"
+          echo "🎯 目标空间: ${{ matrix.space.name }}"
+          echo "🔗 URL: ${{ matrix.space.url }}"
+          
       - name: 安装必要依赖
         id: install_deps
         continue-on-error: true
@@ -143,15 +157,19 @@ jobs:
           URL="${{ matrix.space.url }}"
           SUCCESS=false
           for attempt in 1 2 3; do
+            echo "🔄 请求尝试 #$attempt/3"
             if response=$(curl -sSf -o /dev/null -w '%{json}' --max-time ${{ env.TIMEOUT_SECONDS }} --connect-timeout 10 \
               -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
               -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
+              -H "Accept-Language: en-US,en;q=0.9" \
+              -H "Cache-Control: no-cache" \
               "$URL" 2>/dev/null); then
               SUCCESS=true
               RESPONSE_TIME=$(echo $response | jq -r '.time_total // "0"')
               HTTP_CODE=$(echo $response | jq -r '.http_code // "000"')
               DNS_TIME=$(echo $response | jq -r '.time_namelookup // "0"')
               CONNECT_TIME=$(echo $response | jq -r '.time_connect // "0"')
+              echo "✅ 成功！响应时间: ${RESPONSE_TIME}s, HTTP状态码: $HTTP_CODE"
               echo "status=success" >> $GITHUB_OUTPUT
               echo "response_time=$RESPONSE_TIME" >> $GITHUB_OUTPUT
               echo "http_code=$HTTP_CODE" >> $GITHUB_OUTPUT
@@ -162,6 +180,7 @@ jobs:
                 response_time_ms=$(echo "$RESPONSE_TIME * 1000" | bc 2>/dev/null | cut -d. -f1)
                 if [ -n "$response_time_ms" ] && [ "$response_time_ms" -gt 10000 ] 2>/dev/null; then
                   echo "performance=slow" >> $GITHUB_OUTPUT
+                  echo "::warning::⚠️ 空间 [${{ matrix.space.name }}] 响应缓慢"
                 else
                   echo "performance=normal" >> $GITHUB_OUTPUT
                 fi
@@ -175,6 +194,7 @@ jobs:
               fi
               break
             else
+              echo "::warning::❌ 尝试 #$attempt 失败"
               [ $attempt -lt 3 ] && sleep $((attempt * 5))
             fi
           done
@@ -183,6 +203,7 @@ jobs:
             echo "response_time=N/A" >> $GITHUB_OUTPUT
             echo "http_code=000" >> $GITHUB_OUTPUT
             echo "performance=unknown" >> $GITHUB_OUTPUT
+            echo "::error::❌ 空间 ${{ matrix.space.name }} 健康检查失败"
           fi
 
       - name: 智能重试
@@ -190,13 +211,17 @@ jobs:
         if: steps.health_check.outputs.status == 'failure'
         continue-on-error: true
         run: |
+          echo "🔄 开始深度重试..."
           RETRY_SUCCESS=false
           for i in $(seq 1 ${{ env.RETRY_ATTEMPTS }}); do
             WAIT_TIME=$((2 ** i))
+            echo "🔁 深度重试 $i/${{ env.RETRY_ATTEMPTS }}"
             sleep $WAIT_TIME
             for method in "GET" "HEAD"; do
+              echo "尝试 $method 请求..."
               if curl -X $method -sSf --max-time 30 --connect-timeout 10 "${{ matrix.space.url }}" > /dev/null 2>&1; then
                 RETRY_SUCCESS=true
+                echo "✅ 使用 $method 方法在第 $i 次重试时恢复正常"
                 echo "retry_status=success" >> $GITHUB_OUTPUT
                 echo "retry_method=$method" >> $GITHUB_OUTPUT
                 echo "retry_attempt=$i" >> $GITHUB_OUTPUT
@@ -208,6 +233,7 @@ jobs:
             echo "retry_status=failure" >> $GITHUB_OUTPUT
             echo "retry_method=none" >> $GITHUB_OUTPUT
             echo "retry_attempt=${{ env.RETRY_ATTEMPTS }}" >> $GITHUB_OUTPUT
+            echo "::error::❌ 重试后空间仍然无响应"
           fi
 
       - name: 深度激活请求
@@ -215,6 +241,7 @@ jobs:
         if: steps.health_check.outputs.status == 'success' || steps.retry.outputs.retry_status == 'success'
         continue-on-error: true
         run: |
+          echo "🚀 发送深度激活请求..."
           URL="${{ matrix.space.url }}"
           ACTIVATED_PATHS=""
           SUCCESS_COUNT=0
@@ -225,6 +252,9 @@ jobs:
             if curl -sSf --max-time 10 -H "User-Agent: Mozilla/5.0" "${URL}${path}" > /dev/null 2>&1; then
               ACTIVATED_PATHS="${ACTIVATED_PATHS}${path} "
               SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+              echo "✅ 成功激活: $path"
+            else
+              echo "⚠️ 无法访问: $path"
             fi
             sleep 1
           done
@@ -237,6 +267,7 @@ jobs:
           else
             echo "activation_rate=$SUCCESS_COUNT/$TOTAL_COUNT" >> $GITHUB_OUTPUT
           fi
+          echo "📊 激活完成"
 
       - name: 生成状态报告
         id: report
@@ -246,14 +277,17 @@ jobs:
             echo "final_status=✅ 健康" >> $GITHUB_OUTPUT
             echo "status_emoji=✅" >> $GITHUB_OUTPUT
             echo "numeric_status=1" >> $GITHUB_OUTPUT
+            echo "status_color=32CD32" >> $GITHUB_OUTPUT
           elif [ "${{ steps.retry.outputs.retry_status }}" = "success" ]; then
             echo "final_status=⚠️ 重试后恢复" >> $GITHUB_OUTPUT
             echo "status_emoji=⚠️" >> $GITHUB_OUTPUT
             echo "numeric_status=0" >> $GITHUB_OUTPUT
+            echo "status_color=FFA500" >> $GITHUB_OUTPUT
           else
             echo "final_status=❌ 异常" >> $GITHUB_OUTPUT
             echo "status_emoji=❌" >> $GITHUB_OUTPUT
             echo "numeric_status=-1" >> $GITHUB_OUTPUT
+            echo "status_color=DC143C" >> $GITHUB_OUTPUT
           fi
 
       - name: 保存监控日志
@@ -273,6 +307,7 @@ jobs:
           重试: ${{ steps.retry.outputs.retry_status || '未执行' }}
           激活: ${{ steps.activation.outputs.activation_count || '0' }}/${{ steps.activation.outputs.activation_total || '0' }}
           结果: ${{ steps.report.outputs.final_status }}
+          数值状态: ${{ steps.report.outputs.numeric_status }}
           EOF
 
       - name: 上传日志
@@ -287,18 +322,43 @@ jobs:
       - name: 记录详细指标
         if: always()
         run: |
+          TIMESTAMP=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S CST')
           cat << EOF >> $GITHUB_STEP_SUMMARY
-          ## ${{ steps.report.outputs.status_emoji }} \`${{ matrix.space.name }}\`
+          ## ${{ steps.report.outputs.status_emoji }} 空间监控报告: \`${{ matrix.space.name }}\`
           
+          ### 📊 基本信息
           | 指标 | 值 |
           |------|-----|
-          | URL | [${{ matrix.space.url }}](${{ matrix.space.url }}) |
-          | 状态 | ${{ steps.report.outputs.final_status }} |
-          | 响应时间 | ${{ steps.health_check.outputs.response_time || 'N/A' }}s |
-          | HTTP | ${{ steps.health_check.outputs.http_code || 'N/A' }} |
-          | 性能 | ${{ steps.health_check.outputs.performance == 'slow' && '🐌' || steps.health_check.outputs.performance == 'normal' && '🚀' || '❓' }} |
-          | 重试 | ${{ steps.retry.outputs.retry_status == 'success' && '✅' || steps.retry.outputs.retry_status == 'failure' && '❌' || '➖' }} |
-          | 激活率 | ${{ steps.activation.outputs.activation_rate || 'N/A' }} |
+          | **空间名称** | ${{ matrix.space.name }} |
+          | **URL** | [${{ matrix.space.url }}](${{ matrix.space.url }}) |
+          | **最终状态** | ${{ steps.report.outputs.final_status }} |
+          | **检查时间** | ${TIMESTAMP} |
+          | **触发方式** | ${{ github.event_name == 'workflow_dispatch' && '手动触发' || '定时触发' }} |
+          
+          ### 🔍 检查详情
+          | 指标 | 值 |
+          |------|-----|
+          | **初次检查** | ${{ steps.health_check.outputs.status == 'success' && '✅ 成功' || '❌ 失败' }} |
+          | **响应时间** | ${{ steps.health_check.outputs.response_time || 'N/A' }}s |
+          | **HTTP状态码** | ${{ steps.health_check.outputs.http_code || 'N/A' }} |
+          | **DNS时间** | ${{ steps.health_check.outputs.dns_time || 'N/A' }}s |
+          | **连接时间** | ${{ steps.health_check.outputs.connect_time || 'N/A' }}s |
+          | **性能状态** | ${{ steps.health_check.outputs.performance == 'slow' && '🐌 缓慢' || steps.health_check.outputs.performance == 'normal' && '🚀 正常' || '❓ 未知' }} |
+          | **成功尝试** | 第 ${{ steps.health_check.outputs.attempt || 'N/A' }} 次 |
+          
+          ### 🔄 重试信息
+          | 指标 | 值 |
+          |------|-----|
+          | **重试状态** | ${{ steps.retry.outputs.retry_status == 'success' && '✅ 成功' || steps.retry.outputs.retry_status == 'failure' && '❌ 失败' || '➖ 未执行' }} |
+          | **重试方法** | ${{ steps.retry.outputs.retry_method || 'N/A' }} |
+          | **重试次数** | ${{ steps.retry.outputs.retry_attempt || 'N/A' }} |
+          
+          ### 🚀 激活详情
+          | 指标 | 值 |
+          |------|-----|
+          | **激活执行** | ${{ steps.activation.outcome == 'success' && '✅ 完成' || steps.activation.outcome == 'skipped' && '⏭️ 跳过' || '❌ 失败' }} |
+          | **激活路径** | ${{ steps.activation.outputs.activated_paths || 'N/A' }} |
+          | **激活成功率** | ${{ steps.activation.outputs.activation_rate || 'N/A' }} |
           ---
           EOF
 
@@ -351,9 +411,15 @@ jobs:
           echo "failed=$FAILED" >> $GITHUB_OUTPUT
           if command -v bc &> /dev/null && [ "$TOTAL" -gt 0 ]; then
             SUCCESS_RATE=$(echo "scale=1; $SUCCESS * 100 / $TOTAL" | bc)
+            DEGRADED_RATE=$(echo "scale=1; $DEGRADED * 100 / $TOTAL" | bc)
+            FAILED_RATE=$(echo "scale=1; $FAILED * 100 / $TOTAL" | bc)
             echo "success_rate=${SUCCESS_RATE}%" >> $GITHUB_OUTPUT
+            echo "degraded_rate=${DEGRADED_RATE}%" >> $GITHUB_OUTPUT
+            echo "failed_rate=${FAILED_RATE}%" >> $GITHUB_OUTPUT
           else
             echo "success_rate=$SUCCESS/$TOTAL" >> $GITHUB_OUTPUT
+            echo "degraded_rate=$DEGRADED/$TOTAL" >> $GITHUB_OUTPUT
+            echo "failed_rate=$FAILED/$TOTAL" >> $GITHUB_OUTPUT
           fi
 
       - name: 收集监控结果
@@ -374,8 +440,9 @@ jobs:
           fi
           echo "timestamp=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S CST')" >> $GITHUB_OUTPUT
           echo "next_run_time=$(TZ='Asia/Shanghai' date -d '+6 hours' '+%Y-%m-%d %H:%M:%S CST' 2>/dev/null || echo '计算失败')" >> $GITHUB_OUTPUT
+          echo "trigger_type=${{ github.event_name }}" >> $GITHUB_OUTPUT
 
-      - name: 生成总结报告
+      - name: 生成监控总结报告
         run: |
           cat << 'EOF' >> $GITHUB_STEP_SUMMARY
           # 🎯 HF 空间监控总结
@@ -386,27 +453,42 @@ jobs:
           ## 📊 统计数据
           | 指标 | 数量 | 占比 |
           |------|------|------|
-          | 总空间数 | ${{ steps.stats.outputs.total }} | 100% |
-          | ✅ 健康 | ${{ steps.stats.outputs.success }} | ${{ steps.stats.outputs.success_rate }} |
-          | ⚠️ 降级 | ${{ steps.stats.outputs.degraded }} | - |
-          | ❌ 失败 | ${{ steps.stats.outputs.failed }} | - |
+          | **总空间数** | ${{ steps.stats.outputs.total }} | 100% |
+          | **✅ 健康** | ${{ steps.stats.outputs.success }} | ${{ steps.stats.outputs.success_rate }} |
+          | **⚠️ 降级** | ${{ steps.stats.outputs.degraded }} | ${{ steps.stats.outputs.degraded_rate }} |
+          | **❌ 失败** | ${{ steps.stats.outputs.failed }} | ${{ steps.stats.outputs.failed_rate }} |
           
           ## ⏰ 时间信息
-          - 执行时间: ${{ steps.collect.outputs.timestamp }}
-          - 下次运行: ${{ steps.collect.outputs.next_run_time }}
+          - **执行时间**: ${{ steps.collect.outputs.timestamp }}
+          - **下次运行**: ${{ steps.collect.outputs.trigger_type == 'workflow_dispatch' && '手动触发' || steps.collect.outputs.next_run_time }}
+          - **触发方式**: ${{ steps.collect.outputs.trigger_type == 'workflow_dispatch' && '🔧 手动触发' || '⏰ 定时触发' }}
+          - **调试模式**: ${{ inputs.debug_mode && '🔍 已启用' || '关闭' }}
           
-          ## 📋 监控空间
+          ## 📋 监控的空间列表
           ${{ steps.safe_prepare.outputs.spaces_list }}
           
-          ## 📊 配置
-          - 空间数: ${{ steps.safe_prepare.outputs.space_count }}
-          - 频率: 每6小时 (9/15/21/3点 CST)
-          - 超时: ${{ env.TIMEOUT_SECONDS }}秒
-          - 重试: ${{ env.RETRY_ATTEMPTS }}次
-          - 并发: 最多${{ env.MAX_PARALLEL }}个
+          ## 📊 监控配置
+          | 配置项 | 值 |
+          |--------|-----|
+          | **监控频率** | 每 6 小时 (北京时间 9:00, 15:00, 21:00, 03:00) |
+          | **超时设置** | ${{ env.TIMEOUT_SECONDS }} 秒 |
+          | **重试次数** | ${{ env.RETRY_ATTEMPTS }} 次 |
+          | **并发限制** | 最多 ${{ env.MAX_PARALLEL }} 个 |
+          | **日志保留** | 30 天 |
+          
+          ## 🔔 通知设置
+          - **失败通知**: ${{ steps.collect.outputs.has_failures == 'true' && '将创建 Issue 通知' || '无需通知' }}
+          - **监控状态**: 🟢 系统正常运行
+          
+          ## 💡 使用提示
+          - 所有空间都会进行深度激活以保持活跃状态
+          - 响应时间超过 10 秒的空间会被标记为"缓慢"
+          - 失败的空间会自动进行多次重试
+          - 修改监控列表：编辑 `env.SPACES_TO_MONITOR` 变量
+          - 调整检查频率：修改 `schedule.cron` 表达式
           
           ---
-          *终极优化版 v3.0*
+          *此报告由 GitHub Actions 自动生成 - 终极优化版 v4.0*
           EOF
 
       - name: 智能Issue管理
@@ -425,8 +507,14 @@ jobs:
               success: '${{ steps.stats.outputs.success }}',
               degraded: '${{ steps.stats.outputs.degraded }}',
               failed: '${{ steps.stats.outputs.failed }}',
-              rate: '${{ steps.stats.outputs.success_rate }}'
+              successRate: '${{ steps.stats.outputs.success_rate }}',
+              degradedRate: '${{ steps.stats.outputs.degraded_rate }}',
+              failedRate: '${{ steps.stats.outputs.failed_rate }}'
             };
+            const spaces_list = `${{ steps.safe_prepare.outputs.spaces_list }}`;
+            
+            console.log('🔔 准备Issue管理...');
+            
             try {
               const issues = await github.rest.issues.listForRepo({
                 owner: context.repo.owner,
@@ -435,28 +523,59 @@ jobs:
                 state: 'open',
                 per_page: 10
               });
+              
               const todayIssue = issues.data.find(i => i.title.includes(date));
+              
               if (hasFailures) {
-                const body = `## 🔄 更新 - ${time} CST\n\n` +
-                  `📊 ${stats.success}/${stats.total} 健康 (${stats.rate}) | ⚠️ ${stats.degraded} | ❌ ${stats.failed}\n\n` +
-                  `[详细日志](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`;
+                const body = `## 🔄 更新报告 - ${time} CST
+                
+                ### 📊 监控统计
+                | 状态 | 数量 | 占比 |
+                |------|------|------|
+                | ✅ 健康 | ${stats.success} | ${stats.successRate} |
+                | ⚠️ 降级 | ${stats.degraded} | ${stats.degradedRate} |
+                | ❌ 失败 | ${stats.failed} | ${stats.failedRate} |
+                | **总计** | **${stats.total}** | **100%** |
+                
+                ### 📋 监控的空间
+                ${spaces_list}
+                
+                ### 🔍 可能的原因
+                - Space 处于休眠状态
+                - 网络连接问题
+                - Space 配置错误
+                - HuggingFace 平台问题
+                
+                ### 💡 建议操作
+                1. 查看 [详细日志](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+                2. 手动访问失败的 Space 检查状态
+                3. 如果问题持续，考虑重启 Space
+                
+                ---
+                *自动更新于 ${date} ${time} CST (北京时间)*`;
+                
                 if (todayIssue) {
+                  console.log(`📝 今日已有告警Issue #${todayIssue.number}，添加评论...`);
                   await github.rest.issues.createComment({
                     owner: context.repo.owner,
                     repo: context.repo.repo,
                     issue_number: todayIssue.number,
                     body: body
                   });
+                  console.log('✅ 已更新现有Issue');
                 } else {
-                  await github.rest.issues.create({
+                  console.log('📝 创建新的告警Issue...');
+                  const issue = await github.rest.issues.create({
                     owner: context.repo.owner,
                     repo: context.repo.repo,
-                    title: `[监控告警] HF Space 异常 - ${date}`,
-                    body: `## ⚠️ 监控告警\n\n` + body,
+                    title: `[监控告警] HF Space 健康检查异常 - ${date}`,
+                    body: `## ⚠️ HF Space 健康检查警报\n\n${body}`,
                     labels: ['automated', 'space-health', 'alert']
                   });
+                  console.log(`✅ 已创建Issue #${issue.data.number}`);
                 }
               } else if (todayIssue) {
+                console.log(`📝 问题已恢复，关闭Issue #${todayIssue.number}...`);
                 await github.rest.issues.update({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
@@ -467,11 +586,12 @@ jobs:
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   issue_number: todayIssue.number,
-                  body: `## ✅ 已恢复 - ${time} CST\n\n所有空间正常 (${stats.rate})`
+                  body: `## ✅ 问题已恢复 - ${time} CST\n\n所有空间现已恢复正常运行。\n\n**最终统计**: ${stats.success}/${stats.total} 健康 (${stats.successRate})`
                 });
+                console.log('✅ 已关闭并更新Issue');
               }
             } catch (error) {
-              console.error('Issue管理失败:', error.message);
+              console.error('❌ Issue管理失败:', error.message);
             }
 
       - name: 生成状态徽章
@@ -483,10 +603,22 @@ jobs:
             "critical") BADGE="red"; TEXT="down" ;;
             *) BADGE="lightgrey"; TEXT="unknown" ;;
           esac
+          
           cat << EOF >> $GITHUB_STEP_SUMMARY
           
-          ## 📛 徽章
+          ## 📛 状态徽章
+          
+          将以下徽章添加到 README.md 可实时显示监控状态：
+          
+          \`\`\`markdown
           [![HF Spaces](https://img.shields.io/badge/HF%20Spaces-${TEXT}-${BADGE}?logo=huggingface)](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions)
-          [![Success](https://img.shields.io/badge/Success-${{ steps.stats.outputs.success_rate }}-${BADGE})](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions)
+          [![Success Rate](https://img.shields.io/badge/Success%20Rate-${{ steps.stats.outputs.success_rate }}-${BADGE})](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions)
+          [![Monitored](https://img.shields.io/badge/Monitored-${{ steps.stats.outputs.total }}%20spaces-blue)](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY})
+          \`\`\`
+          
+          预览效果：
+          
+          [![HF Spaces](https://img.shields.io/badge/HF%20Spaces-${TEXT}-${BADGE}?logo=huggingface)](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions)
+          [![Success Rate](https://img.shields.io/badge/Success%20Rate-${{ steps.stats.outputs.success_rate }}-${BADGE})](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions)
           [![Monitored](https://img.shields.io/badge/Monitored-${{ steps.stats.outputs.total }}%20spaces-blue)](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY})
           EOF
