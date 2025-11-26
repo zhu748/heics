@@ -22,7 +22,7 @@ env:
   MAX_PARALLEL: 5
   SPACES_TO_MONITOR: |
     achm|https://latlpa-achm.hf.space
-    agmn|https://latlpa-agmn.hf.space
+    hakd|https://latlpa-hakd.hf.space
     ngld|https://latlpa-ngld.hf.space
 
 jobs:
